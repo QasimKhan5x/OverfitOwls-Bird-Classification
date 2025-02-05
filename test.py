@@ -2,6 +2,9 @@ import os
 from PIL import Image
 import pandas as pd
 
+import timm
+from tqdm import tqdm
+
 import torch
 import torch.nn as nn
 from torchvision import transforms
@@ -9,96 +12,144 @@ from torchvision.transforms import functional as F
 
 
 def main(args):
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     ###########################
     # Load Model
     ###########################
-    model = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitl14_lc')
-    model.linear_head = nn.Sequential(
-        nn.Linear(5120, 1024),  
-        nn.ELU(),             
-        nn.Dropout(p=0.3),     
+    model = timm.create_model(args.model, pretrained=True)
+    # Example head definition
+    model.head = nn.Sequential(
         nn.Linear(1024, 512),
-        nn.ELU(),
-        nn.Dropout(p=0.3),
+        nn.BatchNorm1d(512),
+        nn.GELU(),
+        nn.Dropout(p=0.2),
         nn.Linear(512, 256),
-        nn.ELU(),
-        nn.Dropout(p=0.3),
+        nn.BatchNorm1d(256),
+        nn.GELU(),
+        nn.Dropout(p=0.2),
         nn.Linear(256, 20)
     )
     model = model.to(device)
 
-    checkpoint = torch.load(args.checkpoint_dir + "/best.pth", map_location=device)
+    checkpoint = torch.load(os.path.join(args.checkpoint_dir, "best.pth"), map_location=device)
     model.load_state_dict(checkpoint["model"])
     model.eval()
     print("Using model at epoch", checkpoint["epoch"])
 
-    ###########################
-    # Random TTA Transform
-    ###########################
-    # We'll apply this transform multiple times per image for TTA.
-    tta_transform = transforms.Compose(
-        [
-            transforms.RandomResizedCrop(
-                (392, 392), scale=(0.8, 1.0), interpolation=F.InterpolationMode.BILINEAR
-            ),
-            transforms.RandomHorizontalFlip(p=0.5),
-            transforms.ToTensor(),
-            transforms.Normalize(
-                mean=[0.485, 0.456, 0.406],
-                std=[0.229, 0.224, 0.225],
-            ),
-        ]
-    )
+    ###############################################################################
+    # All transforms produce a final size of 448×448 to match the model’s input size
+    ###############################################################################
 
-    ###########################
-    # Center-Crop Transform
-    ###########################
-    # Resize to 448×448, then center-crop to 392×392.
-    center_transform = transforms.Compose(
-        [
-            transforms.Resize((448, 448), interpolation=F.InterpolationMode.BILINEAR),
-            transforms.CenterCrop(392),
+    ##############
+    # Center-Crop (Normal)
+    ##############
+    # Resize so the *shorter side* is 448, then center-crop 448×448
+    center_transform = transforms.Compose([
+        transforms.Resize(448, interpolation=F.InterpolationMode.BILINEAR),  # shorter side = 448
+        transforms.CenterCrop(448),  # final 448×448
+        transforms.ToTensor(),
+        transforms.Normalize(
+            mean=[0.4815, 0.4578, 0.4082],
+            std=[0.2686, 0.2613, 0.2758]
+        ),
+    ])
+
+    ##############
+    # Center-Crop (Flipped)
+    ##############
+    # Same as above but with forced horizontal flip
+    center_transform_flip = transforms.Compose([
+        transforms.Resize(448, interpolation=F.InterpolationMode.BILINEAR),
+        transforms.CenterCrop(448),
+        transforms.RandomHorizontalFlip(p=1.0),
+        transforms.ToTensor(),
+        transforms.Normalize(
+            mean=[0.4815, 0.4578, 0.4082],
+            std=[0.2686, 0.2613, 0.2758]
+        ),
+    ])
+
+    ##############
+    # Multi-Scale (Normal) Helper
+    ##############
+    # For each scale s ≥ 448: 
+    #   1) Resize(shorter_side=s)
+    #   2) CenterCrop(448) 
+    # => final 448×448
+    def scale_center_transform(image: Image.Image, s: int) -> torch.Tensor:
+        transform = transforms.Compose([
+            transforms.Resize(s, interpolation=F.InterpolationMode.BILINEAR),
+            transforms.CenterCrop(448),  # 448×448 final
             transforms.ToTensor(),
             transforms.Normalize(
-                mean=[0.485, 0.456, 0.406],
-                std=[0.229, 0.224, 0.225],
+                mean=[0.4815, 0.4578, 0.4082],
+                std=[0.2686, 0.2613, 0.2758]
             ),
-        ]
-    )
+        ])
+        return transform(image)
+
+    ##############
+    # Multi-Scale (Flipped) Helper
+    ##############
+    def scale_center_transform_flip(image: Image.Image, s: int) -> torch.Tensor:
+        transform = transforms.Compose([
+            transforms.Resize(s, interpolation=F.InterpolationMode.BILINEAR),
+            transforms.CenterCrop(448),
+            transforms.RandomHorizontalFlip(p=1.0),
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=[0.4815, 0.4578, 0.4082],
+                std=[0.2686, 0.2613, 0.2758]
+            ),
+        ])
+        return transform(image)
 
     ###########################
     # TTA Inference Function
     ###########################
     def tta_inference(
-        image: Image.Image, model: nn.Module, device: torch.device, num_augs: int = 5
+        image: Image.Image,
+        model: nn.Module,
+        device: torch.device,
+        scales: list = [448, 512, 576, 640],
     ) -> torch.Tensor:
         """
-        - Applies 'num_augs' random transformations.
-        - Applies one center-crop transform (zoom-in style).
-        - Averages the outputs from all transforms and returns the averaged logits.
+        Applies:
+          1) Center-crop (normal + flip)
+          2) Multi-scale (normal + flip), each producing a 448×448 final image.
+
+        Averages all logits for the final output.
         """
         outputs = []
 
         with torch.no_grad():
-            # (1) Random transforms
-            for _ in range(num_augs):
-                aug_img = tta_transform(image)
-                aug_img = aug_img.unsqueeze(0).to(device)  # [1, C, H, W]
-                out = model(aug_img)  # [1, num_classes]
-                outputs.append(out)
-
-            # (2) Center-crop transform
-            cc_img = center_transform(image)
-            cc_img = cc_img.unsqueeze(0).to(device)  # [1, C, H, W]
-            out_cc = model(cc_img)  # [1, num_classes]
+            # (1) Center-Crop Normal
+            cc_img = center_transform(image).unsqueeze(0).to(device)
+            out_cc = model(cc_img)
             outputs.append(out_cc)
 
-        # Stack & average all outputs: shape => [num_augs + 1, num_classes]
-        outputs = torch.cat(outputs, dim=0)
-        avg_output = outputs.mean(dim=0, keepdim=True)  # [1, num_classes]
+            # (2) Center-Crop Flipped
+            cc_img_flip = center_transform_flip(image).unsqueeze(0).to(device)
+            out_cc_flip = model(cc_img_flip)
+            outputs.append(out_cc_flip)
+
+            # (3) Multi-Scale (Normal + Flipped)
+            for s in scales:
+                # Normal
+                sc_img = scale_center_transform(image, s).unsqueeze(0).to(device)
+                out_sc = model(sc_img)
+                outputs.append(out_sc)
+
+                # Flipped
+                sc_img_flip = scale_center_transform_flip(image, s).unsqueeze(0).to(device)
+                out_sc_flip = model(sc_img_flip)
+                outputs.append(out_sc_flip)
+
+        # Combine all results and average
+        # total passes: 2 (center-crop) + 2×len(scales) (multi-scale) = 2 + 2N
+        outputs = torch.cat(outputs, dim=0)  # shape [N, num_classes]
+        avg_output = outputs.mean(dim=0, keepdim=True)  # shape [1, num_classes]
         return avg_output
 
     ###########################
@@ -107,21 +158,27 @@ def main(args):
     TEST_DIR = "/gpfs/workdir/yutaoc/bird/bird_dataset/test_images/mistery_cat"
     predictions = []
 
-    for file_name in os.listdir(TEST_DIR):
+    for file_name in tqdm(os.listdir(TEST_DIR), desc="Inference"):
         file_path = os.path.join(TEST_DIR, file_name)
         if not os.path.isfile(file_path):
-            continue  # skip directories, hidden files, etc.
+            continue
 
         image = Image.open(file_path).convert("RGB")
 
-        # Perform TTA inference
-        output = tta_inference(image, model, device, num_augs=5)
+        # TTA Inference
+        output = tta_inference(
+            image, 
+            model, 
+            device, 
+            scales=[448, 512, 576, 640]
+        )
         cls = torch.argmax(output, dim=1).item()
         predictions.append([file_name, cls])
 
+    # Save predictions
     df = pd.DataFrame(predictions, columns=["path", "class_idx"])
-    df.to_csv(f"{args.checkpoint_dir}/submission.csv", index=False)
-    print(f"Predictions saved to {args.checkpoint_dir}/submission.csv")
+    df.to_csv(os.path.join(args.checkpoint_dir, "submission.csv"), index=False)
+    print(f"Predictions saved to {os.path.join(args.checkpoint_dir, 'submission.csv')}")
 
 
 if __name__ == "__main__":
@@ -132,7 +189,12 @@ if __name__ == "__main__":
         "--checkpoint_dir",
         default="checkpoints/dino_combined",
         type=str,
-        help="checkpoint path",
+        help="Checkpoint directory with best.pth",
+    )
+    parser.add_argument(
+        "--model",
+        default="eva02_large_patch14_448.mim_m38m_ft_in22k_in1k",
+        type=str,
     )
     args = parser.parse_args()
     main(args)

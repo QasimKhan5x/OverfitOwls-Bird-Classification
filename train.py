@@ -88,8 +88,8 @@ def evaluate(model, criterion, data_loader, device, print_freq=100, log_suffix="
     num_processed_samples = 0
     with torch.inference_mode():
         for image, target in metric_logger.log_every(data_loader, print_freq, header):
-            image = image.to(device, non_blocking=True)
-            target = target.to(device, non_blocking=True)
+            image = image.to(device)
+            target = target.to(device)
             output = model(image)
             loss = criterion(output, target)
 
@@ -178,6 +178,8 @@ def load_data(traindir, valdir, args):
                 augmix_severity=augmix_severity,
                 backend=args.backend,
                 use_v2=args.use_v2,
+                mean=[0.4815, 0.4578, 0.4082],
+                std=[0.2686, 0.2613, 0.2758]
             ),
             target_transform=utils.class_transform,
         )
@@ -210,6 +212,8 @@ def load_data(traindir, valdir, args):
                 interpolation=interpolation,
                 backend=args.backend,
                 use_v2=args.use_v2,
+                mean=[0.4815, 0.4578, 0.4082],
+                std=[0.2686, 0.2613, 0.2758]
             )
 
         dataset_test = torchvision.datasets.ImageFolder(
@@ -295,28 +299,28 @@ def main(args):
 
     print("Creating model")
     # model = torchvision.models.get_model(args.model, weights=args.weights)
-    # vit_l_14
-    model = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitl14_lc')
-    model.linear_head = nn.Sequential(
-        nn.Linear(5120, 1024),  
-        nn.ELU(),             
-        nn.Dropout(p=0.3),     
-        nn.Linear(1024, 512),
-        nn.ELU(),
-        nn.Dropout(p=0.3),
+    model = timm.create_model(args.model, pretrained=True)
+    model.head = nn.Sequential(
+        nn.Linear(1024, 512),  
+        nn.BatchNorm1d(512),
+        nn.GELU(),
+        nn.Dropout(p=0.2),
         nn.Linear(512, 256),
-        nn.ELU(),
-        nn.Dropout(p=0.3),
+        nn.BatchNorm1d(256),
+        nn.GELU(),
+        nn.Dropout(p=0.2),
         nn.Linear(256, 20)
     )
-    # model.load_state_dict(torch.load("checkpoints/4/best.pth", map_location=device)["model"])
-    # for param in model.parameters():
-    #     param.requires_grad = True
-    
-    for param in model.parameters():
-        param.requires_grad = False
-    for param in model.linear_head.parameters():
-        param.requires_grad = True
+
+    if args.ft_backbone:
+        model.load_state_dict(torch.load(f"{args.checkpoint_dir}/best.pth", map_location=device)["model"])
+        for param in model.parameters():
+            param.requires_grad = True
+    else:
+        for param in model.parameters():
+            param.requires_grad = False
+        for param in model.head.parameters():
+            param.requires_grad = True
     
     # move to cuda
     model.to(device)
@@ -439,7 +443,7 @@ def main(args):
         )
 
     if args.resume:
-        checkpoint = torch.load(args.resume, map_location="cpu", weights_only=True)
+        checkpoint = torch.load(args.resume, map_location="cpu")
         model_without_ddp.load_state_dict(checkpoint["model"])
         if not args.test_only:
             optimizer.load_state_dict(checkpoint["optimizer"])
@@ -505,9 +509,10 @@ def main(args):
             valid_loss, valid_acc1, _ = evaluate(
                 model, criterion, data_loader_test, device=device
             )
-            if train_acc1 > best_train_acc1 and valid_acc1 > best_valid_acc1:
+            if train_acc1 >= best_train_acc1 and valid_acc1 >= best_valid_acc1:
                 best_train_acc1 = train_acc1
                 best_valid_acc1 = valid_acc1
+                print(f"Saved model at Epoch: {epoch}, Train Acc: {train_acc1}, Valid Acc: {valid_acc1}")
                 utils.save_on_master(
                     checkpoint, os.path.join(args.output_dir, "best.pth")
                 )
@@ -811,6 +816,17 @@ def get_args_parser(add_help=True):
         default="PIL",
         type=str.lower,
         help="PIL or tensor - case insensitive",
+    )
+    
+    parser.add_argument(
+        "--ft-backbone",
+        action="store_true",
+        help="enable tracking Exponential Moving Average of model parameters",
+    )
+    parser.add_argument(
+        "--checkpoint-dir",
+        default=None,
+        type=str,
     )
     parser.add_argument("--use-v2", action="store_true", help="Use V2 transforms")
     return parser
