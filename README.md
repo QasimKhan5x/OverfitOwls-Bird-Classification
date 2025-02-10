@@ -13,3 +13,5 @@ Use Python 3.11 with NVIDIA GPU.
 ![OverfitOwls places first in BDMA 7 Kaggle Competition](screenshot.png "Kaggle Competition Private Ranking")
 
 We came 1st in the competition 😊 
+
+Read more about our approach in `report.pdf`.
